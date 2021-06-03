@@ -1,0 +1,441 @@
+---
+title: "Genomic Prediction in HS/Npt"
+author: "Daniel Gatti"
+date: "5/22/2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(stringsAsFactors = FALSE)
+
+library(tidyverse)
+library(ggrepel)
+library(broom)
+library(ROCR)       # Precision/Recall plot.
+library(glmnet)     # Elastic net & support fxns.
+library(readxl)
+library(doMC)       # Parallel execution.
+library(qtl2)
+
+base_dir   = '/media/dmgatti/hdb/projects/ColoState'
+data_dir   = file.path(base_dir,   'data')
+pheno_file = file.path(data_dir,   'GRSD.pheno.powercalc.xlsx')
+qtl2_file  = file.path(data_dir,   'HZEproject_qtl2.Rdata')
+result_dir = file.path(base_dir,   'results')
+gwas_dir   = file.path(result_dir, 'gwas')
+binary_dir = file.path(gwas_dir,   'binary_model', 'radiation_additive')
+prs_dir    = file.path(result_dir, 'polygenic_risk_score', 'individual_phenotypes')
+snp_file = '/media/dmgatti/hda/data/MUGA/hsnpt_variants.sqlite'
+
+# SNP lookup function for qtl2.
+snp_func = create_variant_query_func(dbfile = snp_file)
+
+# Set up for parallel execution.
+registerDoMC(cores = 2)
+```
+
+## Introduction
+
+A set of ~1800 Heterogeneous Stock/Northport (HS/Npt) mice were exposed to different types of radiation and followed for a little over two years. The mice were euthanized when they became moribund or survived to the end of the study. At euthansia, a necropsy was performed and tumor presence was assayed in several organs. The mice were genotyped at ~140,000 markers and, since the founders have been fully sequenced, the founder SNPs were imputed onto the HS/Npt genomes. We retained as set of SNPs with unique SNP patterns between samples to use for genomic prediction, i.e. predicting which mice will develop tumors based on genotype. 
+
+## Methods
+
+The phenotype and genotype data contained 1784 mice in common.
+
+```{r data_setup}
+# Data input and setup.
+
+# Read in qtl2 data.
+load(qtl2_file)
+
+# Read in phenotypes.
+pheno = read_xlsx(pheno_file, sheet = 'GRSD.pheno') %>% 
+          rename_with(.fn = str_to_lower) %>% 
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_') %>% 
+          rename_with(.fn = str_replace_all, pattern = '-', replacement = '_') %>%
+          rename(mouse = animal_number,
+                 age   = `age_(days)`) %>% 
+          mutate(mouse = str_c('X', mouse),
+                 sex   = factor(sex, levels = c('F', 'M')),
+                 group = factor(group),
+                 weight = as.numeric(weight)) %>% 
+          select(mouse:group, euthanized, neoplasia:non_neoplastic, myeloid_leukemia:pret_lymphoma)
+```
+
+The mice are divided into the following groups.
+
+```{r group_table}
+count(pheno, sex, group) %>% 
+  pivot_wider(names_from = sex, values_from = n)
+```
+
+I wanted to collapse the mice into irradiated and unirradiated mice groups for this analysis. Before this, I checked to see if the current groups have an effect on the phenotypes.
+
+```{r group_tukeyhsd}
+pheno_columns = 9:ncol(pheno)
+for(i in pheno_columns) {
+  mod = aov(pheno[[i]] ~ pheno$sex*pheno$group)
+  hsd = TukeyHSD(mod)$`pheno$group`
+} # for(i)
+
+############################
+### TBD: Return to this. Not sure how to evaluate and summarize results here.
+###############################
+
+```
+
+I collapsed the treatment groups into unirradiated, gamma, and HZE.
+
+```{r synch_samples}
+pheno = as.data.frame(pheno)
+rownames(pheno) = pheno$mouse
+pheno$sex = factor(pheno$sex, levels = c('F', 'M'))
+pheno$group = sub('-(Fe|Si)', '', pheno$group)
+pheno$group = sub('^sham ', 'un', pheno$group)
+pheno$group = factor(pheno$group, levels = c('unirradiated', 'gamma', 'HZE'))
+
+# Synch samples.
+samples = intersect(pheno$mouse, rownames(probs[[1]]))
+pheno = pheno[samples,]
+for(i in seq_along(probs)) {
+  
+  probs[[i]] = probs[[i]][samples,,]
+  K[[i]] = K[[i]][samples, samples]
+  
+} # for(i)
+
+covar = model.matrix(~ sex + group, data = pheno)[,-1,drop = FALSE]
+```
+
+I checked the proportion of mice that developed each type of tumor. Many tumor types may not occur in a high enough number of mice to detect a genetic signal. You could also argue that if there is one causal allele and if it is rare, then only a few mice will develop the tumor.
+
+```{r tumor_freq}
+pheno %>% 
+  pivot_longer(cols = neoplasia:pret_lymphoma, names_to = 'pheno', values_to = 'value') %>% 
+  group_by(pheno) %>% 
+  summarize(tumor_prop = mean(value, na.rm = TRUE))
+
+```
+
+
+I performed GWAS on each phenotype using the `qtl2` software package. This fit a logistic regression model at each SNP, without taking the other SNPs in the genome into account. One of the weaknesses of this model is that it fits one locus at a time. While there are multilocus methods for linear models that also include an adjustment for kinship between mice, a linear model ia arguably the wrong model for a binary (tumor / non-tumor) outcome.
+
+```{r gwas}
+pheno_columns = colnames(pheno)[9:ncol(pheno)]
+n_pheno = length(pheno_columns)
+
+# Matrix storing GWAS results.
+gwas_results = NULL
+
+for(pheno_name in pheno_columns) {
+  
+  print(pheno_name)
+  
+  # GWAS using binary model.
+  gwas = scan1snps(genoprobs = probs, map = map, pheno = pheno[,pheno_name, drop = FALSE], 
+                   addcovar = covar, model = 'binary', query_func = snp_func, 
+                   keep_all_snps = FALSE,  cores = 4)
+  saveRDS(gwas, file = file.path(binary_dir,  paste0(pheno_name, '_gwas.rds')))
+  # gwas = readRDS(file = file.path(binary_dir, paste0(pheno_name ,'_gwas.rds')))
+  
+  png(file.path(binary_dir, paste0(pheno_name, '_gwas.png')), width = 2000, height = 1000, res = 128)
+  plot_snpasso(gwas$lod, gwas$snpinfo, main = paste0('HS/Npt, ', pheno_name , ', Binary Model, sex + group covar'))
+  dev.off()
+
+  # Store the results.
+  if(is.null(gwas_results)) {
+
+    gwas_results = data.frame(snp_id = rownames(gwas$lod), 
+                              chr    = gwas$snpinfo$chr, 
+                              pos    = gwas$snpinfo$pos, 
+                              pheno_name = gwas$lod)
+
+  } else {
+    
+    # Join LOD to SNP positions.
+    lod_tmp = data.frame(snp_id = rownames(gwas$lod), pheno_name = gwas$lod)
+    gwas_results = merge(gwas_results, lod_tmp, by = 'snp_id', sort = FALSE)
+    rm(lod_tmp)    
+    
+  } # else
+  
+  rm(gwas)
+  gc()
+
+} # for(pheno_name)
+
+# Add genome Mb positions.
+ch
+rlen = split(gwas_results$pos, gwas_results$chr)
+chrn   = sapply(chrlen, length)
+chrlen = sapply(chrlen, max, na.rm = TRUE)
+chrlen = chrlen[c(1:19, 'X')]
+chrn   = chrn[names(chrlen)]
+chrsum = c(0, cumsum(chrlen)[-length(chrlen)])
+gwas_results$gmb_pos = gwas_results$pos + rep(chrsum, chrn)
+
+saveRDS(gwas_results, file = file.path(gwas_dir, 'gwas_results_summry.rds'))
+
+```
+
+
+```{r load_snps}
+rm(probs)
+gc()
+snps = readRDS(file = file.path(prs_dir, '../snps.rds'))
+```
+
+
+## Results {.tabset}
+
+### Elastic Net 
+
+```{r}
+set.seed(2021051613)
+n_sim = 10
+prop_train = 0.8
+# Sample factor is the grouping for each sex & radiation group.
+sample_fctr = factor(pheno$sex:pheno$group)
+samples = rownames(pheno)
+samples = split(samples, sample_fctr)
+sample_n = sapply(samples, length)
+
+pheno_columns = colnames(pheno)[9:ncol(pheno)]
+n_pheno = length(pheno_columns)
+
+# Make a one-row dataframe to use for holding results.
+new_df = data.frame(pheno = '', auc = 0, num_snps = 0, tp = 0, fp = 0, tn = 0, fn = 0)
+test_results = new_df
+train_results = test_results
+
+for(pheno_name in pheno_columns) {
+  
+  print(pheno_name)
+  
+  for(i in 1:n_sim) {
+    
+    curr_train_res = new_df
+    curr_test_res  = new_df
+    curr_train_res$pheno = pheno_name
+    curr_test_res$pheno  = pheno_name
+
+    # Sample evenly from each sex and radiation group.
+    training_samples = unlist(mapply(x = samples, y = sample_n, 
+                                     FUN = function(x, y) { sample(x, round(prop_train * y)) }))
+    test_samples     = setdiff(unlist(samples), training_samples)
+    
+    save(training_samples, test_samples, 
+         file = file.path(prs_dir, paste0(pheno_name, '_train_test_samples.Rdata')))
+    
+    # Training. Use cross-validation to select a lambda.
+    cvmod = cv.glmnet(x = snps[training_samples,], 
+                      y = pheno[training_samples, pheno_name], 
+                      alpha = 0.5, family = 'binomial', parallel = TRUE)
+    
+    # Fit model using *all* training set data with lambda form CV.
+    mod = glmnet(x = snps[training_samples,], 
+                 y = pheno[training_samples, pheno_name],
+                 lambda = cvmod$lambda.min, alpha = 0.5, 
+                 family = 'binomial', parallel = TRUE)
+  
+    # Save this model.
+    saveRDS(mod, file = file.path(prs_dir, paste0(pheno_name, '_', i, '_lasso_model.rds')))
+    
+    # Evaluate the training set.
+    auc = assess.glmnet(mod, newy = pheno[training_samples, pheno_name], 
+                        newx = snps[training_samples,], family = 'binomial')
+    curr_train_res$auc = auc$auc
+    
+    # Get confusion matrix.
+    conf_tbl = confusion.glmnet(mod, newy = pheno[training_samples, pheno_name], 
+                                     newx = snps[training_samples,], family = 'binomial')
+    if(nrow(conf_tbl) < 2) {
+      if(rownames(conf_tbl) == '0') {
+        conf_tbl = matrix(c(conf_tbl[1,], 0, 0), 2, 2, byrow = TRUE, dimnames = list(c(0, 1), c(0, 1)))
+      } else {
+        conf_tbl = matrix(c(0, 0, conf_tbl[1,]), 2, 2, byrow = TRUE, dimnames = list(c(0, 1), c(0, 1)))
+      } # else
+    } # if(nrow(conf_tbl) < 2)
+
+    curr_train_res$tp = conf_tbl[2, 2]
+    curr_train_res$fp = conf_tbl[2, 1]
+    curr_train_res$tn = conf_tbl[1, 1]
+    curr_train_res$fn = conf_tbl[1, 2]
+
+    # Get test set coefs.
+    lasso_coef = coef(mod)
+    lasso_coef = as.matrix(lasso_coef[which(lasso_coef != 0),,drop = FALSE])
+    # Remove non-SNP predictors.
+    lasso_coef = subset(lasso_coef, !grepl('Intercept|sex|group', rownames(lasso_coef)))
+    num_snps = nrow(lasso_coef)
+    curr_train_res$num_snps = num_snps
+
+    if(nrow(lasso_coef) > 0) {
+
+      lasso_coef = data.frame(snp_id = rownames(lasso_coef), coef = lasso_coef)
+      tmp = merge(lasso_coef, gwas_results[,c('snp_id', pheno_name)], by = 'snp_id', sort = FALSE)
+    
+      png(file = file.path(prs_dir, paste0(pheno_name, '_', i, '_lod_vs_lasso_coef.png')),
+          width = 800, height = 800, res = 128)
+      plot(tmp[,3:2], xlab = 'GWAS LOD', ylab = 'model coef', main = paste0(pheno_name, ' LOD vs. LASSO coef'))
+      dev.off()
+
+    } # if(nrow(lasso_coef) > 0)
+    
+    # Sensitivity / Specificity plot.
+    png(file = file.path(prs_dir, paste0(pheno_name, '_', i, '_training_auc.png')),
+        width = 1600, height = 800, res = 128)
+    layout(matrix(1:2, 1, 2))
+    roc = roc.glmnet(mod, newy = pheno[training_samples, pheno_name], 
+                          newx = snps[training_samples,])
+    plot(roc, main = paste(pheno_name, ', Num SNPs =', num_snps,
+         ', AUC =', round(train_results[pheno_name, 'auc'], digits = 3)),
+         xlim = c(0, 1), ylim = c(0, 1), type = 'l')
+    abline(0, 1, lty = 2)
+    
+    preds = predict.glmnet(mod, newx = snps[training_samples,], type = 'class')
+    perf = performance(prediction(preds, pheno[training_samples, pheno_name]), 
+                       measure = 'prec', x.measure = 'rec')
+    plot(perf, main = paste(pheno_name, 'Precision/Recall'),
+         xlim = c(0, 1), ylim = c(0, 1))
+    abline(h = mean(pheno$solid_tumor), lty = 2)
+    dev.off()
+    
+    # Evaluate test set.
+    auc = assess.glmnet(mod, newy = pheno[test_samples, pheno_name], 
+                             newx = snps[test_samples,], family = 'binomial')
+    curr_test_res$auc = auc$auc
+    
+    # Get confusion matrix.
+    conf_tbl = confusion.glmnet(mod, newy = pheno[test_samples, pheno_name], 
+                                     newx = snps[test_samples,], family = 'binomial')
+    if(nrow(conf_tbl) < 2) {
+      if(rownames(conf_tbl) == '0') {
+        conf_tbl = matrix(c(conf_tbl[1,], 0, 0), 2, 2, byrow = TRUE, dimnames = list(c(0, 1), c(0, 1)))
+      } else {
+        conf_tbl = matrix(c(0, 0, conf_tbl[1,]), 2, 2, byrow = TRUE, dimnames = list(c(0, 1), c(0, 1)))
+      } # else
+    } # if(nrow(conf_tbl) < 2)
+
+    curr_test_res$tp = conf_tbl[2, 2]
+    curr_test_res$fp = conf_tbl[2, 1]
+    curr_test_res$tn = conf_tbl[1, 1]
+    curr_test_res$fn = conf_tbl[1, 2]
+  
+    # Get test set coefs.
+    lasso_coef = coef(mod)
+    lasso_coef = lasso_coef[which(lasso_coef != 0),]
+    num_snps = length(grep('^([0-9]|X)', names(lasso_coef)))
+    curr_test_res$num_snps = num_snps
+    
+    # Sensitivity / Specificity plot.
+    png(file = file.path(prs_dir, paste0(pheno_name, '_', i, '_test_auc.png')),
+        width = 1600, height = 800, res = 128)
+    layout(matrix(1:2, 1, 2))
+    roc = roc.glmnet(mod, newy = pheno[test_samples, pheno_name], 
+                          newx = snps[test_samples,])
+    plot(roc, main = paste(pheno_name, ', Num SNPs =', num_snps,
+         ', AUC =', round(test_results[pheno_name, 'auc'], digits = 3)),
+         xlim = c(0, 1), ylim = c(0, 1), type = 'l')
+    abline(0, 1, lty = 2)
+    
+    preds = predict.glmnet(mod, newx = snps[test_samples,], type = 'class')
+    perf = performance(prediction(preds, pheno[test_samples, pheno_name]), 
+                       measure = 'prec', x.measure = 'rec')
+    plot(perf, main = paste(pheno_name, 'Precision/Recall'),
+         xlim = c(0, 1), ylim = c(0, 1))
+    abline(h = mean(pheno$solid_tumor), lty = 2)
+    dev.off()
+    
+    rm(cvmod, mod, mod_all, preds, perf)
+    gc()
+    
+    # Append current results to overall results.
+    train_results = rbind(train_results, curr_train_res)
+    test_results  = rbind(test_results,  curr_test_res)
+  
+  } # for(pheno_name)
+  
+  train_results = subset(train_results, pheno_name != '')
+  test_results  = subset(test_results,  pheno_name != '')
+  
+  write.csv(train_results, file = file.path(prs_dir, 'genomic_pred_train_auc.csv'),
+            row.names = F, quote = F)
+  write.csv(test_results, file = file.path(prs_dir, 'genomic_pred_test_auc.csv'),
+            row.names = F, quote = F)
+} # for(i)
+```
+
+```{r eval_results}
+test_results = read.csv(file = file.path(prs_dir, 'genomic_pred_test_auc.csv'))
+
+test_results %>% 
+  filter(pheno != '') %>% 
+  ggplot() +
+    geom_boxplot(aes(reorder(pheno, auc, median), auc)) +
+    geom_hline(aes(yintercept = 0.5), color = 'red') +
+    coord_flip()
+```
+
+Look at the proportion of mice with tumors of each type vs. AUC. 
+
+```{r tumor_prop_vs_auc}
+tumor_prop = pheno %>% 
+               select(neoplasia:pret_lymphoma) %>% 
+               pivot_longer(cols = everything(), names_to = 'pheno', values_to = 'value') %>% 
+               group_by(pheno) %>% 
+               summarize(tumor_prop = mean(value, na.rm = TRUE))
+
+test_results %>% 
+  select(pheno, auc) %>% 
+  filter(pheno != '') %>% 
+  group_by(pheno) %>% 
+  summarize(mean_auc = mean(auc, na.rm = TRUE)) %>% 
+  left_join(tumor_prop, by = 'pheno') %>% 
+  ggplot() +
+    geom_point(aes(tumor_prop, mean_auc)) +
+    geom_text_repel(aes(tumor_prop, mean_auc, label = pheno))
+```
+
+When I look at the model output, for the rare tumors, it just calls all mice 'non-tumor' and takes the hit on the positive tumor mice. This gives the artificial appearance of good performance. 
+
+How did using lambda within 1 SE of the minimum MSE vs. lambda that gave the minimum MSE work?
+
+```{r lambda_comparison}
+minse = read.csv(file = file.path(prs_dir, 'genomic_pred_test_auc_lambda_minse.csv')) %>% 
+          filter(pheno != '') %>% 
+          select(pheno, auc)
+onese = read.csv(file = file.path(prs_dir, 'genomic_pred_test_auc_lambda_1se.csv')) %>% 
+          filter(pheno != '') %>% 
+          select(pheno, auc)
+
+full_join(minse, onese, by = 'pheno') %>% 
+  group_by(pheno) %>% 
+  summarize(across(.cols = auc.x:auc.y, .fns = c(mean = mean, sd = sd))) %>% 
+  ggplot() +
+    geom_pointrange(aes(auc.x_mean, auc.y_mean, ymin = auc.y_mean - auc.y_sd, ymax = auc.y_mean + auc.y_sd, color = pheno)) +
+    geom_pointrange(aes(auc.x_mean, auc.y_mean, xmin = auc.x_mean - auc.x_sd, xmax = auc.x_mean + auc.x_sd, color = pheno)) +
+    geom_abline(aes(intercept = 0, slope = 1)) +
+    labs(x = 'Lambda Min SE', y = 'Lambda 1 SE') +
+    lims(x = c(0.4, 1.0), y = c(0.4, 1.0))
+```
+
+It looks like the minimum SE produced higher AUCs, even though AUC doesn't tell the whole story. 
+
+### Using GWAS SNPs.
+
+# Select SNPs with high LOD scores that are not in high LD with each other.
+
+```{r }
+pheno_name = 'thyroid_tumor'
+
+mod = glmnet(x = snps, y = pheno[,pheno_name], family = 'binomial')
+
+tmp = merge(gwas_results, as.matrix(coef(mod)))
+
+```
+
